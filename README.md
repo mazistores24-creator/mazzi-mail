@@ -34,7 +34,7 @@ This version is a **preview-only campaign manager**. It imports contacts with co
 ## Deployment
 
 - **Render API:** Create a Blueprint from `render.yaml`. Set `MONGODB_URI` to your MongoDB Atlas connection string and `CLIENT_ORIGIN` to your deployed Vercel origin. Keep the Atlas URI in Render's environment settings; do not commit it.
-- **Vercel client:** Import the repository with the project root set to `client`; Vercel will use `client/vercel.json`. Set `VITE_API_URL` to the Render API origin (for example, `https://your-api.onrender.com`) and redeploy.
+- **Vercel client:** Import the repository with the project root set to `client`; Vercel will use `client/vercel.json`. The production build sets `VITE_API_URL` from `client/.env.production`; update it there (or override it in Vercel's environment settings) if the Render API URL changes.
 - In MongoDB Atlas, allow network access from the Render service and ensure the database user has access to the application database. Atlas is the database; it does not receive source-code pushes.
 
 The client uses the Vite proxy locally when `VITE_API_URL` is unset. `CLIENT_ORIGIN` accepts a comma-separated list if more than one browser origin is needed.
