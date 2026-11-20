@@ -2,6 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import cookieParser from 'cookie-parser';
 import Contact from './models/Contact.js';
 import Campaign from './models/Campaign.js';
 import EmailProvider from './models/EmailProvider.js';
@@ -9,13 +12,17 @@ import DeliveryRecord from './models/DeliveryRecord.js';
 import License from './models/License.js';
 import TrialUsage from './models/TrialUsage.js';
 import SuppressionList from './models/SuppressionList.js';
+import User from './models/User.js';
 import { testProviderConnection, sendEmail, generateUnsubscribeToken, renderMergeFields, clearTransporterCache } from './mailer.js';
 
 const app = express();
 const port = Number(process.env.PORT) || 5001;
+const JWT_SECRET = process.env.JWT_SECRET || 'mazzi-mail-secret-change-in-production';
+const JWT_EXPIRES = process.env.JWT_EXPIRES || '7d';
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5174').split(',').map(origin => origin.trim());
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
+app.use(cookieParser());
 const connected = () => mongoose.connection.readyState === 1;
 
 // In-memory fallback stores
@@ -25,6 +32,48 @@ const memoryProviders = [];
 const memoryDeliveryRecords = new Map();
 const memorySuppression = new Map();
 const memoryLicense = { status: 'inactive', trialEmailsSent: 0, trialLimit: 30 };
+const memoryUsers = new Map();
+
+// Auth helpers
+function sanitizeUser(user) {
+  const obj = user.toObject ? user.toObject() : { ...user };
+  delete obj.passwordHash;
+  return obj;
+}
+
+function generateToken(user) {
+  return jwt.sign({ id: user._id || user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+}
+
+function setTokenCookie(res, token) {
+  res.cookie('token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 });
+}
+
+function clearTokenCookie(res) {
+  res.clearCookie('token', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+}
+
+async function authenticate(req, res, next) {
+  const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ message: 'Authentication required.' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    let user;
+    if (connected()) user = await User.findById(decoded.id).lean();
+    else user = memoryUsers.get(decoded.id);
+    if (!user) return res.status(401).json({ message: 'User not found.' });
+    if (user.status !== 'approved' && user.role !== 'admin') return res.status(403).json({ message: 'Account not approved.' });
+    req.user = { ...sanitizeUser(user), id: user._id || user.id };
+    next();
+  } catch {
+    return res.status(401).json({ message: 'Invalid or expired token.' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') return res.status(403).json({ message: 'Admin access required.' });
+  next();
+}
 
 // Background worker state
 let workerRunning = false;
@@ -45,6 +94,29 @@ async function ensureDefaultTrial() {
     if (!license) {
       license = new License({ status: 'inactive', trialLimit: 30, trialEmailsSent: 0 });
       await license.save();
+    }
+  } catch { /* ignore */ }
+}
+
+async function ensureDefaultAdmin() {
+  try {
+    let admin;
+    if (connected()) {
+      admin = await User.findOne({ role: 'admin' });
+      if (!admin) {
+        const passwordHash = await bcrypt.hash('admin123', 10);
+        admin = new User({ email: 'admin@mazzi.mail', passwordHash, name: 'Admin', role: 'admin', status: 'approved', approvedAt: new Date() });
+        await admin.save();
+        console.log('Default admin created: admin@mazzi.mail / admin123');
+      }
+    } else {
+      admin = [...memoryUsers.values()].find(u => u.role === 'admin');
+      if (!admin) {
+        const passwordHash = await bcrypt.hash('admin123', 10);
+        admin = { email: 'admin@mazzi.mail', passwordHash, name: 'Admin', role: 'admin', status: 'approved', approvedAt: new Date(), _id: 'mem-admin', createdAt: new Date() };
+        memoryUsers.set(admin._id, admin);
+        console.log('Default admin created (memory): admin@mazzi.mail / admin123');
+      }
     }
   } catch { /* ignore */ }
 }
@@ -89,8 +161,128 @@ async function recordTrialEmails(count) {
 // Health
 app.get('/api/health', (_req, res) => res.json({ ok: true, database: connected() ? 'connected' : 'memory mode', mode: 'live sending' }));
 
+// ---------- Auth ----------
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, name } = req.body || {};
+    if (!email || !password || !name) return res.status(400).json({ message: 'Email, password, and name are required.' });
+    if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+
+    let existing;
+    if (connected()) existing = await User.findOne({ email: email.toLowerCase() });
+    else existing = [...memoryUsers.values()].find(u => u.email === email.toLowerCase());
+    if (existing) return res.status(400).json({ message: 'Email already registered.' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userData = { email: email.toLowerCase(), passwordHash, name, role: 'user', status: 'pending' };
+
+    let user;
+    if (connected()) {
+      user = new User(userData);
+      await user.save();
+    } else {
+      user = { ...userData, _id: `mem-${Date.now()}`, createdAt: new Date() };
+      memoryUsers.set(user._id, user);
+    }
+
+    const token = generateToken(user);
+    setTokenCookie(res, token);
+    return res.status(201).json({ user: sanitizeUser(user), message: 'Registration submitted. Awaiting admin approval.' });
+  } catch (error) { return res.status(500).json({ message: 'Registration failed.', detail: error.message }); }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ message: 'Email and password are required.' });
+
+    let user;
+    if (connected()) user = await User.findOne({ email: email.toLowerCase() });
+    else user = [...memoryUsers.values()].find(u => u.email === email.toLowerCase());
+    if (!user) return res.status(401).json({ message: 'Invalid credentials.' });
+
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return res.status(401).json({ message: 'Invalid credentials.' });
+
+    if (user.status !== 'approved' && user.role !== 'admin') {
+      return res.status(403).json({ message: 'Account not approved. Please wait for admin approval.' });
+    }
+
+    if (connected()) {
+      await User.findByIdAndUpdate(user._id, { $set: { lastLoginAt: new Date() } });
+    } else {
+      user.lastLoginAt = new Date();
+    }
+
+    const token = generateToken(user);
+    setTokenCookie(res, token);
+    return res.json({ user: sanitizeUser(user), message: 'Login successful.' });
+  } catch (error) { return res.status(500).json({ message: 'Login failed.', detail: error.message }); }
+});
+
+app.post('/api/auth/logout', (_req, res) => {
+  clearTokenCookie(res);
+  return res.json({ message: 'Logged out.' });
+});
+
+app.get('/api/auth/me', authenticate, async (req, res) => {
+  return res.json({ user: req.user });
+});
+
+// ---------- Admin User Management ----------
+app.get('/api/admin/users', authenticate, requireAdmin, async (_req, res) => {
+  try {
+    let users;
+    if (connected()) {
+      users = await User.find().sort({ createdAt: -1 }).lean();
+    } else {
+      users = [...memoryUsers.values()].map(sanitizeUser);
+    }
+    return res.json(users);
+  } catch (error) { return res.status(500).json({ message: 'Could not load users.', detail: error.message }); }
+});
+
+app.post('/api/admin/users/:id/approve', authenticate, requireAdmin, async (req, res) => {
+  try {
+    let user;
+    if (connected()) {
+      user = await User.findByIdAndUpdate(req.params.id, { $set: { status: 'approved', approvedAt: new Date(), approvedBy: req.user.id } }, { new: true }).lean();
+    } else {
+      user = memoryUsers.get(req.params.id);
+      if (user) { user.status = 'approved'; user.approvedAt = new Date(); user.approvedBy = req.user.id; memoryUsers.set(req.params.id, user); }
+    }
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    return res.json({ user: sanitizeUser(user), message: 'User approved.' });
+  } catch (error) { return res.status(500).json({ message: 'Could not approve user.', detail: error.message }); }
+});
+
+app.post('/api/admin/users/:id/reject', authenticate, requireAdmin, async (req, res) => {
+  try {
+    let user;
+    if (connected()) {
+      user = await User.findByIdAndUpdate(req.params.id, { $set: { status: 'rejected', rejectedAt: new Date(), rejectedBy: req.user.id } }, { new: true }).lean();
+    } else {
+      user = memoryUsers.get(req.params.id);
+      if (user) { user.status = 'rejected'; user.rejectedAt = new Date(); user.rejectedBy = req.user.id; memoryUsers.set(req.params.id, user); }
+    }
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    return res.json({ user: sanitizeUser(user), message: 'User rejected.' });
+  } catch (error) { return res.status(500).json({ message: 'Could not reject user.', detail: error.message }); }
+});
+
+app.delete('/api/admin/users/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    if (connected()) {
+      await User.findByIdAndDelete(req.params.id);
+    } else {
+      memoryUsers.delete(req.params.id);
+    }
+    return res.json({ message: 'User deleted.' });
+  } catch (error) { return res.status(500).json({ message: 'Could not delete user.', detail: error.message }); }
+});
+
 // ---------- Providers ----------
-app.get('/api/providers', async (_req, res) => {
+app.get('/api/providers', authenticate, async (_req, res) => {
   try {
     let providers;
     if (connected()) {
@@ -102,7 +294,7 @@ app.get('/api/providers', async (_req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load providers.', detail: error.message }); }
 });
 
-app.post('/api/providers', async (req, res) => {
+app.post('/api/providers', authenticate, async (req, res) => {
   try {
     const { name, host, port, username, password, encryption, senderName, senderEmail, isEnabled, isDefault, dailyLimit, hourlyLimit } = req.body || {};
     if (!name || !host || !port || !username || !password || !senderName || !senderEmail) {
@@ -127,7 +319,7 @@ app.post('/api/providers', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not save provider.', detail: error.message }); }
 });
 
-app.get('/api/providers/:id', async (req, res) => {
+app.get('/api/providers/:id', authenticate, async (req, res) => {
   try {
     let provider;
     if (connected()) {
@@ -140,7 +332,7 @@ app.get('/api/providers/:id', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load provider.', detail: error.message }); }
 });
 
-app.put('/api/providers/:id', async (req, res) => {
+app.put('/api/providers/:id', authenticate, async (req, res) => {
   try {
     const { name, host, port, username, password, encryption, senderName, senderEmail, isEnabled, isDefault, dailyLimit, hourlyLimit } = req.body || {};
     const updates = {};
@@ -173,7 +365,7 @@ app.put('/api/providers/:id', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not update provider.', detail: error.message }); }
 });
 
-app.delete('/api/providers/:id', async (req, res) => {
+app.delete('/api/providers/:id', authenticate, async (req, res) => {
   try {
     if (connected()) {
       await EmailProvider.findByIdAndDelete(req.params.id);
@@ -187,7 +379,7 @@ app.delete('/api/providers/:id', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not delete provider.', detail: error.message }); }
 });
 
-app.post('/api/providers/:id/test', async (req, res) => {
+app.post('/api/providers/:id/test', authenticate, async (req, res) => {
   try {
     let provider;
     if (connected()) {
@@ -208,7 +400,7 @@ app.post('/api/providers/:id/test', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Connection test failed.', detail: error.message }); }
 });
 
-app.post('/api/providers/:id/toggle', async (req, res) => {
+app.post('/api/providers/:id/toggle', authenticate, async (req, res) => {
   try {
     const { isEnabled } = req.body || {};
     if (typeof isEnabled !== 'boolean') return res.status(400).json({ message: 'isEnabled is required.' });
@@ -227,7 +419,7 @@ app.post('/api/providers/:id/toggle', async (req, res) => {
 });
 
 // ---------- Contacts ----------
-app.post('/api/contacts/import', async (req, res) => {
+app.post('/api/contacts/import', authenticate, async (req, res) => {
   const { contacts = [], columnMap } = req.body || {};
   if (!Array.isArray(contacts) || contacts.length > 10000) return res.status(400).json({ message: 'Provide up to 10,000 contacts.' });
   const cleaned = contacts.filter(row => row.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(row.email))).map(row => ({
@@ -251,7 +443,7 @@ app.post('/api/contacts/import', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not save contacts.', detail: error.message }); }
 });
 
-app.get('/api/contacts', async (_req, res) => {
+app.get('/api/contacts', authenticate, async (_req, res) => {
   try {
     let contacts;
     if (connected()) {
@@ -267,7 +459,7 @@ app.get('/api/contacts', async (_req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load contacts.', detail: error.message }); }
 });
 
-app.get('/api/contacts/:id', async (req, res) => {
+app.get('/api/contacts/:id', authenticate, async (req, res) => {
   try {
     let contact;
     if (connected()) {
@@ -280,7 +472,7 @@ app.get('/api/contacts/:id', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load contact.', detail: error.message }); }
 });
 
-app.delete('/api/contacts/:id', async (req, res) => {
+app.delete('/api/contacts/:id', authenticate, async (req, res) => {
   try {
     if (connected()) await Contact.findByIdAndDelete(req.params.id);
     else memoryContacts.delete(req.params.id);
@@ -289,7 +481,7 @@ app.delete('/api/contacts/:id', async (req, res) => {
 });
 
 // ---------- License ----------
-app.get('/api/license/status', async (_req, res) => {
+app.get('/api/license/status', authenticate, async (_req, res) => {
   try {
     let license;
     if (connected()) {
@@ -303,7 +495,7 @@ app.get('/api/license/status', async (_req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load license status.', detail: error.message }); }
 });
 
-app.post('/api/license/activate', async (req, res) => {
+app.post('/api/license/activate', authenticate, async (req, res) => {
   try {
     const { licenseKey } = req.body || {};
     if (!licenseKey || !licenseKey.trim()) return res.status(400).json({ message: 'License key is required.' });
@@ -327,7 +519,7 @@ app.post('/api/license/activate', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Activation failed.', detail: error.message }); }
 });
 
-app.post('/api/license/trial', async (_req, res) => {
+app.post('/api/license/trial', authenticate, async (_req, res) => {
   try {
     let license;
     if (connected()) {
@@ -351,7 +543,7 @@ app.post('/api/license/trial', async (_req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Trial activation failed.', detail: error.message }); }
 });
 
-app.post('/api/license/validate', async (_req, res) => {
+app.post('/api/license/validate', authenticate, async (_req, res) => {
   try {
     if (connected()) {
       const license = await License.findOne();
@@ -369,7 +561,7 @@ app.post('/api/license/validate', async (_req, res) => {
 });
 
 // ---------- Campaigns ----------
-app.post('/api/campaigns', async (req, res) => {
+app.post('/api/campaigns', authenticate, async (req, res) => {
   try {
     const { subject, messagePlain, messageHtml, messageAmp, emailFormat, senderName, senderEmail, replyTo, cc, bcc, providerId, dailyLimit, contacts = [], batchSize, requestDelayMs, maxRetries, testMode } = req.body || {};
     if (!subject || !subject.trim()) return res.status(400).json({ message: 'Subject is required.' });
@@ -444,7 +636,7 @@ app.post('/api/campaigns', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not create campaign.', detail: error.message }); }
 });
 
-app.get('/api/campaigns', async (_req, res) => {
+app.get('/api/campaigns', authenticate, async (_req, res) => {
   try {
     let campaigns;
     if (connected()) {
@@ -456,7 +648,7 @@ app.get('/api/campaigns', async (_req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load campaigns.', detail: error.message }); }
 });
 
-app.get('/api/campaigns/:id', async (req, res) => {
+app.get('/api/campaigns/:id', authenticate, async (req, res) => {
   try {
     let campaign;
     if (connected()) {
@@ -469,7 +661,7 @@ app.get('/api/campaigns/:id', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load campaign.', detail: error.message }); }
 });
 
-app.get('/api/campaigns/:id/recipients', async (req, res) => {
+app.get('/api/campaigns/:id/recipients', authenticate, async (req, res) => {
   try {
     let records;
     if (connected()) {
@@ -481,7 +673,7 @@ app.get('/api/campaigns/:id/recipients', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not load recipients.', detail: error.message }); }
 });
 
-app.get('/api/campaigns/:id/stats', async (req, res) => {
+app.get('/api/campaigns/:id/stats', authenticate, async (req, res) => {
   try {
     let campaign;
     if (connected()) campaign = await Campaign.findById(req.params.id).lean();
@@ -505,7 +697,7 @@ app.get('/api/campaigns/:id/stats', async (req, res) => {
 });
 
 // ---------- Campaign controls ----------
-app.post('/api/campaigns/:id/start', async (req, res) => {
+app.post('/api/campaigns/:id/start', authenticate, async (req, res) => {
   try {
     let campaign;
     if (connected()) campaign = await Campaign.findById(req.params.id);
@@ -532,7 +724,7 @@ app.post('/api/campaigns/:id/start', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not start campaign.', detail: error.message }); }
 });
 
-app.post('/api/campaigns/:id/pause', async (req, res) => {
+app.post('/api/campaigns/:id/pause', authenticate, async (req, res) => {
   try {
     if (connected()) {
       await Campaign.findByIdAndUpdate(req.params.id, { $set: { status: 'paused', pausedAt: new Date() } });
@@ -544,7 +736,7 @@ app.post('/api/campaigns/:id/pause', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not pause campaign.', detail: error.message }); }
 });
 
-app.post('/api/campaigns/:id/resume', async (req, res) => {
+app.post('/api/campaigns/:id/resume', authenticate, async (req, res) => {
   try {
     if (connected()) {
       await Campaign.findByIdAndUpdate(req.params.id, { $set: { status: 'running', pausedAt: null } });
@@ -557,7 +749,7 @@ app.post('/api/campaigns/:id/resume', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Could not resume campaign.', detail: error.message }); }
 });
 
-app.post('/api/campaigns/:id/stop', async (req, res) => {
+app.post('/api/campaigns/:id/stop', authenticate, async (req, res) => {
   try {
     if (connected()) {
       await Campaign.findByIdAndUpdate(req.params.id, { $set: { status: 'stopped', completedAt: new Date() } });
@@ -598,7 +790,7 @@ app.post('/api/unsubscribe/:token', async (req, res) => {
   } catch (error) { return res.status(500).json({ message: 'Unsubscribe failed.', detail: error.message }); }
 });
 
-app.get('/api/suppression', async (_req, res) => {
+app.get('/api/suppression', authenticate, async (_req, res) => {
   try {
     let list;
     if (connected()) list = await SuppressionList.find().sort({ unsubscribedAt: -1 }).limit(1000).lean();
@@ -715,6 +907,7 @@ async function init() {
     console.log('MONGODB_URI is not set; using in-memory mode.');
   }
   await ensureDefaultTrial();
+  await ensureDefaultAdmin();
   await resetProviderCountersIfNeeded();
   serverInstance = app.listen(port, () => console.log(`Mazzi Mail API listening at http://localhost:${port}`));
   startWorker();
